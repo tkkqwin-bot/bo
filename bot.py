@@ -20,7 +20,7 @@ from telegram.ext import (
 )
 
 # ── Config ───────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8706837235:AAHK8ADJM6KXZk9XRU2aHWIxkOyGpZwMs1Q")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 SECRET_KEY = os.environ.get("SECRET_KEY", "patriot-tap-secret-change-me")
 DB_PATH = os.environ.get("DB_PATH", "keys.db")
