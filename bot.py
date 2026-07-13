@@ -31,6 +31,9 @@ SECRET_KEY = "patriot-tap-change-me"         # любой секрет
 TURSO_URL = "libsql://patriottap-tkkqwin-bot.aws-eu-west-1.turso.io"
 TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODM5MTUxODMsImlkIjoiMDE5ZjU5OWQtNjUwMS03YTNhLWI0YzctMmJkMDMxZTA5YmI3Iiwia2lkIjoiUHhjWmN3SXBsQllrMGE0VDhjWWppcGZBTkY3TEJMbW5uYXVRR2hxODRBbyIsInJpZCI6ImI1Mzk2M2IyLTMyNmMtNDBmYi05NWM0LTdmNzQyZmY0MDJhNSJ9.KtjElXqsEo_6jn7Nmv6UrrvKKWtJ0_10Ce936sXlkgu0Yo_jK_GXVzoAva3rYC_iJu21YtV7xHsk-ucJkL0tCg"
 
+# конвертируем libsql:// → https://
+TURSO_HTTP = TURSO_URL.replace("libsql://", "https://")
+
 KEY_PREFIX = "PT"
 KEY_LENGTH = 16
 
@@ -58,7 +61,7 @@ def start_health_server():
 # ── Turso HTTP helper ────────────────────────────────────────────
 async def turso_exec(sql: str, args: list = None) -> dict:
     """Execute SQL via Turso HTTP API v2 pipeline"""
-    url = f"{TURSO_URL}/v2/pipeline"
+    url = f"{TURSO_HTTP}/v2/pipeline"
     stmts = [{"type": "execute", "stmt": {"sql": sql}}]
     if args:
         stmts[0]["stmt"]["args"] = [{"type": "text", "value": str(a)} for a in args]
@@ -73,7 +76,7 @@ async def turso_exec(sql: str, args: list = None) -> dict:
 
 async def turso_query(sql: str, args: list = None) -> list:
     """Query rows from Turso"""
-    url = f"{TURSO_URL}/v2/pipeline"
+    url = f"{TURSO_HTTP}/v2/pipeline"
     stmts = [{"type": "execute", "stmt": {"sql": sql}}]
     if args:
         stmts[0]["stmt"]["args"] = [{"type": "text", "value": str(a)} for a in args]
