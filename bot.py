@@ -1,37 +1,86 @@
 """
 PatriotTap License Bot
 Telegram bot for generating/managing license keys
+Uses Turso (libSQL) HTTP API — shared DB with Netlify Functions
 Deploy on Koyeb via Docker
 """
 
 import os
-import sqlite3
-import hashlib
-import hmac
+import json
 import secrets
 import string
+import hashlib
+import hmac
 from datetime import datetime, timedelta
 from functools import wraps
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import httpx
+from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
+    Application, CommandHandler, ContextTypes,
 )
 
-# ── Config ───────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8706837235:AAHK8ADJM6KXZk9XRU2aHWIxkOyGpZwMs1Q")
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "8655580052").split(",") if x.strip()]
-SECRET_KEY = os.environ.get("SECRET_KEY", "patriot-tap-secret-change-me")
-DB_PATH = os.environ.get("DB_PATH", "keys.db")
-KEY_PREFIX = "PT"
-KEY_LENGTH = 16  # chars after prefix
+# ── Config — ЗАПОЛНИ СВОИ ДАННЫЕ ─────────────────────────────────
+BOT_TOKEN = "8706837235:AAHK8ADJM6KXZk9XRU2aHWIxkOyGpZwMs1Q"               # от @BotFather
+ADMIN_IDS = [8655580052]                      # твой ID (от @userinfobot)
+SECRET_KEY = "patriot-tap-change-me"         # любой секрет
 
-# ── Database ─────────────────────────────────────────────────────
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
+# Turso (https://turso.tech → Create Database → Copy URL + Token)
+TURSO_URL = "libsql://patriottap-tkkqwin-bot.aws-eu-west-1.turso.io"
+TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODM5MTUxODMsImlkIjoiMDE5ZjU5OWQtNjUwMS03YTNhLWI0YzctMmJkMDMxZTA5YmI3Iiwia2lkIjoiUHhjWmN3SXBsQllrMGE0VDhjWWppcGZBTkY3TEJMbW5uYXVRR2hxODRBbyIsInJpZCI6ImI1Mzk2M2IyLTMyNmMtNDBmYi05NWM0LTdmNzQyZmY0MDJhNSJ9.KtjElXqsEo_6jn7Nmv6UrrvKKWtJ0_10Ce936sXlkgu0Yo_jK_GXVzoAva3rYC_iJu21YtV7xHsk-ucJkL0tCg"
+
+KEY_PREFIX = "PT"
+KEY_LENGTH = 16
+
+http_client = httpx.AsyncClient(timeout=15)
+
+
+# ── Turso HTTP helper ────────────────────────────────────────────
+async def turso_exec(sql: str, args: list = None) -> dict:
+    """Execute SQL via Turso HTTP API v2 pipeline"""
+    url = f"{TURSO_URL}/v2/pipeline"
+    stmts = [{"type": "execute", "stmt": {"sql": sql}}]
+    if args:
+        stmts[0]["stmt"]["args"] = [{"type": "text", "value": str(a)} for a in args]
+
+    resp = await http_client.post(url, json={"requests": stmts}, headers={
+        "Authorization": f"Bearer {TURSO_TOKEN}",
+        "Content-Type": "application/json",
+    })
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def turso_query(sql: str, args: list = None) -> list:
+    """Query rows from Turso"""
+    url = f"{TURSO_URL}/v2/pipeline"
+    stmts = [{"type": "execute", "stmt": {"sql": sql}}]
+    if args:
+        stmts[0]["stmt"]["args"] = [{"type": "text", "value": str(a)} for a in args]
+    stmts.append({"type": "close"})
+
+    resp = await http_client.post(url, json={"requests": stmts}, headers={
+        "Authorization": f"Bearer {TURSO_TOKEN}",
+        "Content-Type": "application/json",
+    })
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Parse result into list of dicts
+    results = data.get("results", [])
+    if not results:
+        return []
+    first = results[0]
+    cols = [c["name"] for c in first.get("result", {}).get("cols", [])]
+    rows = []
+    for row in first.get("result", {}).get("rows", []):
+        rows.append({cols[i]: row[i].get("value") for i in range(len(cols))})
+    return rows
+
+
+# ── Database init ────────────────────────────────────────────────
+async def init_db():
+    await turso_exec("""
         CREATE TABLE IF NOT EXISTS keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             key TEXT UNIQUE NOT NULL,
@@ -44,225 +93,184 @@ def init_db():
             note TEXT DEFAULT ''
         )
     """)
-    conn.commit()
-    conn.close()
+    print("Turso DB initialized.")
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 # ── Key generation ───────────────────────────────────────────────
-def generate_key():
+def generate_key() -> str:
     alphabet = string.ascii_uppercase + string.digits
-    # Remove confusing chars (0/O, I/1)
     alphabet = alphabet.replace("O", "").replace("I", "").replace("1", "")
-    random_part = ''.join(secrets.choice(alphabet) for _ in range(KEY_LENGTH))
-    return f"{KEY_PREFIX}-{random_part[:4]}-{random_part[4:8]}-{random_part[8:]}"
+    rand = ''.join(secrets.choice(alphabet) for _ in range(KEY_LENGTH))
+    return f"{KEY_PREFIX}-{rand[:4]}-{rand[4:8]}-{rand[8:]}"
 
-def generate_hmac_signature(key: str) -> str:
-    return hmac.new(SECRET_KEY.encode(), key.encode(), hashlib.sha256).hexdigest()[:8]
 
-def create_key(days: int, created_by: int, note: str = "") -> str:
+async def create_key(days: int, created_by: int, note: str = "") -> str:
     key = generate_key()
     expires_at = (datetime.utcnow() + timedelta(days=days)).isoformat()
-    db = get_db()
-    db.execute(
+    await turso_exec(
         "INSERT INTO keys (key, days, expires_at, created_by, note) VALUES (?, ?, ?, ?, ?)",
-        (key, days, expires_at, created_by, note),
+        [key, days, expires_at, created_by, note],
     )
-    db.commit()
-    db.close()
     return key
 
-def revoke_key(key: str) -> bool:
-    db = get_db()
-    c = db.execute("UPDATE keys SET revoked = 1 WHERE key = ?", (key,))
-    db.commit()
-    changed = c.rowcount > 0
-    db.close()
-    return changed
 
-def get_key_info(key: str):
-    db = get_db()
-    row = db.execute("SELECT * FROM keys WHERE key = ?", (key,)).fetchone()
-    db.close()
-    return dict(row) if row else None
+async def revoke_key(key: str) -> bool:
+    result = await turso_exec("UPDATE keys SET revoked = 1 WHERE key = ?", [key])
+    return True
 
-def list_keys(active_only=True):
-    db = get_db()
+
+async def get_key_info(key: str):
+    rows = await turso_query("SELECT * FROM keys WHERE key = ?", [key])
+    return rows[0] if rows else None
+
+
+async def list_keys(active_only=True):
     if active_only:
-        rows = db.execute(
+        return await turso_query(
             "SELECT * FROM keys WHERE revoked = 0 AND expires_at > datetime('now') ORDER BY created_at DESC"
-        ).fetchall()
-    else:
-        rows = db.execute("SELECT * FROM keys ORDER BY created_at DESC LIMIT 50").fetchall()
-    db.close()
-    return [dict(r) for r in rows]
+        )
+    return await turso_query("SELECT * FROM keys ORDER BY created_at DESC LIMIT 50")
 
-def count_keys():
-    db = get_db()
-    total = db.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
-    active = db.execute(
-        "SELECT COUNT(*) FROM keys WHERE revoked = 0 AND expires_at > datetime('now')"
-    ).fetchone()[0]
-    db.close()
-    return total, active
 
-# ── Auth decorator ───────────────────────────────────────────────
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in ADMIN_IDS:
-            await update.message.reply_text("Access denied.")
-            return
-        return await func(update, context)
-    return wrapper
+async def count_keys():
+    total_r = await turso_query("SELECT COUNT(*) as c FROM keys")
+    active_r = await turso_query(
+        "SELECT COUNT(*) as c FROM keys WHERE revoked = 0 AND expires_at > datetime('now')"
+    )
+    return total_r[0]["c"], active_r[0]["c"]
+
 
 # ── Commands ─────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "**PatriotTap License Bot**\n\n"
+        "*PatriotTap License Bot*\n\n"
         "Commands:\n"
         "/generate `<days> [note]` — Generate a key\n"
         "/revoke `<KEY>` — Revoke a key\n"
         "/info `<KEY>` — Key details\n"
         "/list — List active keys\n"
-        "/stats — Key statistics\n"
+        "/stats — Statistics\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Access denied.")
-        return
+        return await update.message.reply_text("Access denied.")
 
     args = context.args
     if not args:
-        await update.message.reply_text("Usage: `/generate 30 [note]`", parse_mode="Markdown")
-        return
+        return await update.message.reply_text("Usage: `/generate 30 [note]`", parse_mode="Markdown")
 
     try:
         days = int(args[0])
     except ValueError:
-        await update.message.reply_text("Days must be a number.")
-        return
+        return await update.message.reply_text("Days must be a number.")
 
     note = " ".join(args[1:]) if len(args) > 1 else ""
-
-    key = create_key(days, update.effective_user.id, note)
-    sig = generate_hmac_signature(key)
+    key = await create_key(days, update.effective_user.id, note)
+    sig = hmac.new(SECRET_KEY.encode(), key.encode(), hashlib.sha256).hexdigest()[:8]
     expires = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
 
     text = (
-        f"**Key Generated**\n\n"
+        f"*Key Generated*\n\n"
         f"`{key}`\n\n"
-        f"Duration: **{days}** days\n"
-        f"Expires: **{expires}**\n"
+        f"Duration: *{days}* days\n"
+        f"Expires: *{expires}*\n"
         f"Signature: `{sig}`\n"
     )
     if note:
         text += f"Note: {note}\n"
-
     await update.message.reply_text(text, parse_mode="Markdown")
+
 
 async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Access denied.")
-        return
-
+        return await update.message.reply_text("Access denied.")
     if not context.args:
-        await update.message.reply_text("Usage: `/revoke PT-XXXX-XXXX-XXXX`", parse_mode="Markdown")
-        return
+        return await update.message.reply_text("Usage: `/revoke PT-XXXX-XXXX-XXXX`", parse_mode="Markdown")
 
     key = context.args[0].upper()
-    info = get_key_info(key)
+    info = await get_key_info(key)
     if not info:
-        await update.message.reply_text(f"Key `{key}` not found.", parse_mode="Markdown")
-        return
-    if info["revoked"]:
-        await update.message.reply_text(f"Key `{key}` is already revoked.", parse_mode="Markdown")
-        return
+        return await update.message.reply_text(f"Key `{key}` not found.", parse_mode="Markdown")
 
-    revoke_key(key)
-    await update.message.reply_text(f"Key `{key}` has been **revoked**.", parse_mode="Markdown")
+    await revoke_key(key)
+    await update.message.reply_text(f"Key `{key}` revoked.", parse_mode="Markdown")
+
 
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Access denied.")
-        return
-
+        return await update.message.reply_text("Access denied.")
     if not context.args:
-        await update.message.reply_text("Usage: `/info PT-XXXX-XXXX-XXXX`", parse_mode="Markdown")
-        return
+        return await update.message.reply_text("Usage: `/info PT-XXXX-XXXX-XXXX`", parse_mode="Markdown")
 
     key = context.args[0].upper()
-    info = get_key_info(key)
+    info = await get_key_info(key)
     if not info:
-        await update.message.reply_text(f"Key `{key}` not found.", parse_mode="Markdown")
-        return
+        return await update.message.reply_text(f"Key `{key}` not found.", parse_mode="Markdown")
 
-    status = "Revoked" if info["revoked"] else ("Expired" if datetime.fromisoformat(info["expires_at"]) < datetime.utcnow() else "Active")
-    status_color = "Red" if status in ("Revoked", "Expired") else "Green"
+    status = "Revoked" if info["revoked"] else ("Expired" if info["expires_at"] < datetime.utcnow().isoformat() else "Active")
 
     text = (
-        f"**Key Info**\n\n"
+        f"*Key Info*\n\n"
         f"Key: `{info['key']}`\n"
         f"HWID: `{info['hwid'] or 'Unbound'}`\n"
         f"Duration: {info['days']} days\n"
         f"Expires: {info['expires_at']}\n"
-        f"Status: **{status}**\n"
+        f"Status: *{status}*\n"
         f"Created: {info['created_at']}\n"
         f"Note: {info['note'] or 'None'}\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Access denied.")
-        return
+        return await update.message.reply_text("Access denied.")
 
-    keys = list_keys(active_only=False)
+    keys = await list_keys(active_only=False)
     if not keys:
-        await update.message.reply_text("No keys found.")
-        return
+        return await update.message.reply_text("No keys found.")
 
-    text = "**All Keys**\n\n"
-    for k in keys[:30]:  # Telegram message limit
-        status = "Revoked" if k["revoked"] else ("Expired" if datetime.fromisoformat(k["expires_at"]) < datetime.utcnow() else "Active")
+    text = "*All Keys*\n\n"
+    for k in keys[:30]:
+        status = "Revoked" if k["revoked"] else ("Expired" if k["expires_at"] < datetime.utcnow().isoformat() else "Active")
         text += f"`{k['key']}` — {status} — {k['expires_at'][:10]}\n"
-
     if len(keys) > 30:
-        text += f"\n... and {len(keys) - 30} more"
+        text += f"\n...and {len(keys) - 30} more"
 
     await update.message.reply_text(text, parse_mode="Markdown")
+
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Access denied.")
-        return
+        return await update.message.reply_text("Access denied.")
 
-    total, active = count_keys()
+    total, active = await count_keys()
     text = (
-        f"**Statistics**\n\n"
-        f"Total keys: **{total}**\n"
-        f"Active keys: **{active}**\n"
-        f"Revoked/Expired: **{total - active}**\n"
+        f"*Statistics*\n\n"
+        f"Total: *{total}*\n"
+        f"Active: *{active}*\n"
+        f"Revoked/Expired: *{total - active}*\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 # ── Main ─────────────────────────────────────────────────────────
+async def post_init(app: Application):
+    await init_db()
+    print(f"Admin IDs: {ADMIN_IDS}")
+    print("Bot ready.")
+
+
 def main():
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN not set")
-        return
-    if not ADMIN_IDS:
-        print("WARNING: ADMIN_IDS not set, no one can manage keys")
+    if not BOT_TOKEN or BOT_TOKEN == "ТВОЙ_БОТ_ТОКЕН":
+        return print("ERROR: Заполни BOT_TOKEN в bot.py")
+    if not TURSO_URL or "your-db" in TURSO_URL:
+        return print("ERROR: Заполни TURSO_URL и TURSO_TOKEN в bot.py")
 
-    init_db()
-    print("Database initialized.")
-
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
@@ -275,6 +283,7 @@ def main():
 
     print("Bot starting...")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
