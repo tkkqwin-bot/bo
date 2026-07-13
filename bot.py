@@ -11,7 +11,9 @@ import secrets
 import string
 import hashlib
 import hmac
-from datetime import datetime, timedelta
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import httpx
@@ -21,8 +23,8 @@ from telegram.ext import (
 )
 
 # ── Config — ЗАПОЛНИ СВОИ ДАННЫЕ ─────────────────────────────────
-BOT_TOKEN = "8706837235:AAHK8ADJM6KXZk9XRU2aHWIxkOyGpZwMs1Q"               # от @BotFather
-ADMIN_IDS = [8655580052]                      # твой ID (от @userinfobot)
+BOT_TOKEN = "8706837235:AAHK8ADJM6KXZk9XRU2aHWIxkOyGpZwMs1Q"
+ADMIN_IDS = [8655580052]
 SECRET_KEY = "patriot-tap-change-me"         # любой секрет
 
 # Turso (https://turso.tech → Create Database → Copy URL + Token)
@@ -33,6 +35,24 @@ KEY_PREFIX = "PT"
 KEY_LENGTH = 16
 
 http_client = httpx.AsyncClient(timeout=15)
+
+
+# ── Health check (Render requires a port) ───────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Health check on port {port}")
 
 
 # ── Turso HTTP helper ────────────────────────────────────────────
@@ -106,7 +126,7 @@ def generate_key() -> str:
 
 async def create_key(days: int, created_by: int, note: str = "") -> str:
     key = generate_key()
-    expires_at = (datetime.utcnow() + timedelta(days=days)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
     await turso_exec(
         "INSERT INTO keys (key, days, expires_at, created_by, note) VALUES (?, ?, ?, ?, ?)",
         [key, days, expires_at, created_by, note],
@@ -170,7 +190,7 @@ async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = " ".join(args[1:]) if len(args) > 1 else ""
     key = await create_key(days, update.effective_user.id, note)
     sig = hmac.new(SECRET_KEY.encode(), key.encode(), hashlib.sha256).hexdigest()[:8]
-    expires = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+    expires = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%d")
 
     text = (
         f"*Key Generated*\n\n"
@@ -210,7 +230,7 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not info:
         return await update.message.reply_text(f"Key `{key}` not found.", parse_mode="Markdown")
 
-    status = "Revoked" if info["revoked"] else ("Expired" if info["expires_at"] < datetime.utcnow().isoformat() else "Active")
+    status = "Revoked" if info["revoked"] else ("Expired" if info["expires_at"] < datetime.now(timezone.utc).isoformat() else "Active")
 
     text = (
         f"*Key Info*\n\n"
@@ -235,7 +255,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "*All Keys*\n\n"
     for k in keys[:30]:
-        status = "Revoked" if k["revoked"] else ("Expired" if k["expires_at"] < datetime.utcnow().isoformat() else "Active")
+        status = "Revoked" if k["revoked"] else ("Expired" if k["expires_at"] < datetime.now(timezone.utc).isoformat() else "Active")
         text += f"`{k['key']}` — {status} — {k['expires_at'][:10]}\n"
     if len(keys) > 30:
         text += f"\n...and {len(keys) - 30} more"
@@ -269,6 +289,8 @@ def main():
         return print("ERROR: Заполни BOT_TOKEN в bot.py")
     if not TURSO_URL or "your-db" in TURSO_URL:
         return print("ERROR: Заполни TURSO_URL и TURSO_TOKEN в bot.py")
+
+    start_health_server()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
